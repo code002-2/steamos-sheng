@@ -21,8 +21,10 @@ def main() -> int:
     path = sys.argv[1]
     keyword = sys.argv[2] if len(sys.argv) > 2 else "rootfs"
 
+    # 只读前 4 MiB：GPT 头在 LBA1、分区表在 LBA2（128 项 × 128 B = 16 KiB），全在文件开头。
+    # 底包整盘镜像有 7.1 GB，绝不能整个读进内存。
     with open(path, "rb") as fh:
-        data = fh.read()
+        data = fh.read(4194304)
 
     if len(data) < 2 * SECTOR or data[SECTOR:SECTOR + 8] != b"EFI PART":
         print(f"不是 GPT：LBA1 处没有 'EFI PART' 签名（读了 {len(data)} 字节）", file=sys.stderr)

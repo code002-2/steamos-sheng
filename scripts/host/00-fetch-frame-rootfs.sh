@@ -34,6 +34,7 @@ WORK="${WORK:-/mnt/frame-work}"
 OUT="${OUT:-$WORK/out}"
 MNT="$WORK/frame-src"
 HEAD="$WORK/frame-head.bin"
+IMG="$WORK/frame.img"          # 整盘 GPT 镜像（只在原始 bz2 路径下用到，切完分区立刻删）
 FRAME="$OUT/rootfs.frame"
 sudo mkdir -p "$WORK" "$OUT"
 
@@ -94,48 +95,46 @@ if [[ "${#ASSETS[@]}" -gt 0 ]]; then
   log "资产路径完成：$GOT 字节"
   df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
 else
-  log "没有可用的底包资产，走原始路径（官方 bz2 → GPT → 切分区）"
+  log "没有可用的底包资产，走原始路径（官方 bz2 → 整盘 GPT → 切分区）"
 
 # ---------------------------------------------------------------------------
-# 1) 第 1 遍：流式取镜像头（只落盘 4 MB）——用于解析 GPT 分区表
-#    head 读够就退出，上游 curl/bunzip2 会收到 SIGPIPE，所以这里临时关掉 pipefail，
-#    改用「文件内容是否含 EFI PART」来判定成败（下载失败时头文件必然是空的/不完整）。
+# 1) 流式下载并解压整盘镜像（curl | bunzip2 > 文件，不落 bz2）
+#    这里 bunzip2 是「读到流尾」的正常消费，不存在下游提前关管的问题 —— 之前试图
+#    用 `curl | bunzip2 | dd skip=X count=Y` 一遍切出来，dd 写够就退出导致上游 EPIPE，
+#    实测只产出 25 MB（管道早关的坑），改成「文件→文件」两段式，行为完全确定。
+#    磁盘：整盘 7.1 GB（此时无 bz2）→ 切出 5 GB 分区（峰值 12.1 GB）→ 删掉整盘。
 # ---------------------------------------------------------------------------
-log "第 1 遍：流式取镜像头（前 4 MB）"
+log "下载并解压 → 整盘 GPT 镜像（约 7.1 GB）"
+rm -f "$IMG"
 set +o pipefail
-DLOAD | bunzip2 -c 2>/dev/null | head -c 4194304 > "$HEAD"
+DLOAD | bunzip2 -c > "$IMG"
+rc_dload="${PIPESTATUS[0]}"
 set -o pipefail
-[[ -s "$HEAD" ]] || die "取镜像头失败：三个候选地址都拿不到数据"
-log "镜像头: $(stat -c %s "$HEAD") 字节"
+[[ "$rc_dload" -eq 0 ]] || die "下载失败（curl $rc_dload）"
+GOT_IMG="$(stat -c %s "$IMG" 2>/dev/null || echo 0)"
+[[ "$GOT_IMG" -gt 6442450944 ]] || die "整盘镜像只有 $GOT_IMG 字节（期望 >6 GiB），下载/解压被截断"
+log "整盘镜像: $(du -h "$IMG" | cut -f1)"
+df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
 
 # ---------------------------------------------------------------------------
-# 2) 解析分区表，定位 rootfs 分区（按名字找 rootfs*，兜底第 2 个分区）
+# 2) 解析分区表，按**名字**定位 rootfs 分区（真实底包里 p2 是 64 MiB 的 efi-A，
+#    硬编码分区号会切错 —— 实测踩过），然后文件→文件精确切出
 # ---------------------------------------------------------------------------
-python3 "$HERE/parse-gpt.py" "$HEAD" rootfs 2>&1 | sed 's/^/[gpt] /' >&2 || true
-read -r ROOTFS_OFF ROOTFS_LEN ROOTFS_NAME < <(python3 "$HERE/parse-gpt.py" "$HEAD" rootfs) \
+python3 "$HERE/parse-gpt.py" "$IMG" rootfs 2>&1 | sed 's/^/[gpt] /' >&2 || true
+read -r ROOTFS_OFF ROOTFS_LEN ROOTFS_NAME < <(python3 "$HERE/parse-gpt.py" "$IMG" rootfs) \
   || die "解析 GPT 分区表失败（底包结构可能变了）"
 [[ "$ROOTFS_OFF" =~ ^[0-9]+$ && "$ROOTFS_LEN" =~ ^[0-9]+$ ]] || die "解析出的偏移/长度非法: '$ROOTFS_OFF' '$ROOTFS_LEN'"
 [[ "$ROOTFS_LEN" -gt 1073741824 ]] || die "rootfs 分区只有 $ROOTFS_LEN 字节，明显不对"
+[[ $(( ROOTFS_OFF + ROOTFS_LEN )) -le "$GOT_IMG" ]] || die "rootfs 分区越界（偏移 $ROOTFS_OFF + 长度 $ROOTFS_LEN > 镜像 $GOT_IMG）"
 log "rootfs 分区: '$ROOTFS_NAME' 偏移 $ROOTFS_OFF 长度 $((ROOTFS_LEN / 1024 / 1024)) MiB"
 
-# ---------------------------------------------------------------------------
-# 3) 第 2 遍：流式切出 rootfs 分区（bz2 → 跳过 OFFSET → 只写 LEN 字节）
-#    同样关掉 pipefail（dd 写够就停，上游必然 SIGPIPE），改用「产出文件大小」判定成败。
-# ---------------------------------------------------------------------------
-log "第 2 遍：流式切出 $((ROOTFS_LEN / 1024 / 1024)) MiB（bz2 无法跳读，需从头解一遍）"
+log "切出 rootfs 分区 → $FRAME（文件→文件 dd，无管道）"
 rm -f "$FRAME"
-set +o pipefail
-DLOAD | bunzip2 -c | dd of="$FRAME" bs=1M iflag=skip_bytes,count_bytes \
-  skip="$ROOTFS_OFF" count="$ROOTFS_LEN" status=none
-rc_dload="${PIPESTATUS[0]}"
-set -o pipefail
-# dd 写够就停 → 上游必然 SIGPIPE，所以不能用 pipeline 状态判定；DLOAD 自己已把 23 当成功。
-# 但只要 DLOAD 真的失败（网络断了/所有地址都不通），就必须立刻退出：
-# 继续跑下去只会写出一半的分区镜像，挂载阶段报的错会离真正原因很远。
-[[ "$rc_dload" -eq 0 ]] || die "下载失败（curl $rc_dload），分区没切全"
+dd if="$IMG" of="$FRAME" bs=4M iflag=skip_bytes,count_bytes \
+  skip="$ROOTFS_OFF" count="$ROOTFS_LEN" status=none || die "dd 切分区失败"
 GOT="$(stat -c %s "$FRAME" 2>/dev/null || echo 0)"
-[[ "$GOT" -eq "$ROOTFS_LEN" ]] || die "切分区失败：期望 $ROOTFS_LEN 字节，实际 $GOT 字节（下载被截断？）"
-rm -f "$HEAD"
+[[ "$GOT" -eq "$ROOTFS_LEN" ]] || die "切分区失败：期望 $ROOTFS_LEN 字节，实际 $GOT 字节"
+rm -f "$IMG" "$HEAD" && log "已删除整盘镜像，释放空间"
 log "已切出: $(du -h "$FRAME" | cut -f1)"
 df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
 fi
