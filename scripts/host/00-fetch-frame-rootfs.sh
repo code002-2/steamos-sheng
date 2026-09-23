@@ -28,9 +28,23 @@ IMG="$WORK/frame.img"
 
 # 1) 下载（支持复用已下载文件）
 if [[ ! -s "$BZ" ]]; then
-  log "下载底包: $FRAME_IMAGE_URL"
-  curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o "$BZ.part" "$FRAME_IMAGE_URL" || die "下载失败"
-  mv -f "$BZ.part" "$BZ"
+  # 候选地址：`steamframe-repair-latest` 别名在 CDN 上会返回 BlobNotFound（CI 实测），
+  # 因此把明确的版本化文件名作为兜底；两者都试。
+  CANDIDATES=(
+    "$FRAME_IMAGE_URL"
+    "https://steamdeck-images.steamos.cloud/recovery/steamframe-oobe-repair-20260922.5153644-0.3.0.img.bz2"
+    "https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2"
+  )
+  ok=0
+  for u in "${CANDIDATES[@]}"; do
+    [[ -n "$u" ]] || continue
+    log "尝试下载: $u"
+    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o "$BZ.part" "$u"; then
+      mv -f "$BZ.part" "$BZ"; ok=1; break
+    fi
+    warn "该地址不可用（curl $?），换下一个"; rm -f "$BZ.part"
+  done
+  [[ "$ok" -eq 1 ]] || die "底包下载失败：所有候选地址都不可用"
 fi
 log "底包大小: $(du -h "$BZ" | cut -f1)"
 
