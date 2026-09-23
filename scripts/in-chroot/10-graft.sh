@@ -47,9 +47,12 @@ if ! pacman -U --noconfirm --color never "${pkgs[@]}"; then
   if ! pacman -U --noconfirm --color never "${pkgs[@]}"; then
     # 兜底：Frame 自带的内部仓库补不上依赖时，用 --nodeps 强装（文件照常就位；
     # 缺的运行期依赖由 Frame 自身 userspace 提供），但明确告警以便人工核查。
-    warn "依赖仍不满足 → 改用 --nodeps 强装（记下上面的 pacman -T 输出！）"
-    pacman -U --noconfirm --color never --nodeps "${pkgs[@]}" \
-      || die "设备包安装失败（连 --nodeps 都装不上）"
+    # 兜底：--nodeps 跳过依赖检查；--overwrite '*' 覆盖文件冲突
+    # （Frame 的固件包名可能不是 linux-firmware*，我们的 firmware-xiaomi-sheng 与它文件路径重叠，
+    #   pacman 会以 "exists in filesystem" 拒绝安装，而 --nodeps 并不跳过文件冲突检查）
+    warn "改用 --nodeps --overwrite '*' 强装（记下上面的 pacman -T 输出与文件冲突清单！）"
+    pacman -U --noconfirm --color never --nodeps --overwrite '*' "${pkgs[@]}" \
+      || die "设备包安装失败（连 --nodeps --overwrite 都装不上）"
   fi
 fi
 
