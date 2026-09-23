@@ -22,7 +22,8 @@ if [[ "${#kp[@]}" -gt 0 ]]; then
   pacman -Rdd --noconfirm --color never "${kp[@]}" || warn "移除内核失败（继续）"
 fi
 # Frame 固件包也换掉（我们替换 linux-firmware 语义）
-mapfile -t fp < <(pacman -Qq 2>/dev/null | grep -E '^linux-firmware' || true)
+# 放宽到所有固件包：Frame 可能叫 steamos-firmware / linux-firmware-* / 其它
+  mapfile -t fp < <(pacman -Qq 2>/dev/null | grep -Ei '(^linux-firmware|firmware)' || true)
 [[ "${#fp[@]}" -gt 0 ]] && pacman -Rdd --noconfirm --color never "${fp[@]}" || true
 
 # 0.5) 我们的包是 makepkg 产物（未签名），Frame 的 pacman.conf 若强制校验本地包签名，
