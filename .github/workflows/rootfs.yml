@@ -83,6 +83,14 @@ jobs:
           echo "boot_pattern=$PATTERN" >> "$GITHUB_OUTPUT"
           echo "boot_mode=${{ inputs.boot_mode }} / label=$LABEL / boot=$PATTERN"
 
+      - name: Free disk space (Frame 底包 5 GB + 目标镜像要同时存在)
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY/CodeQL" 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h / | tail -1
+
       - name: Install Host Tools
         run: |
           sudo apt-get update -qq

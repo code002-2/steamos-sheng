@@ -12,6 +12,12 @@ SHRINK="${SHRINK_IMAGE:-true}"
 
 umount -R "$MOUNT" 2>/dev/null || umount "$MOUNT" 2>/dev/null || warn "挂载点未挂载: $MOUNT"
 sync
+# 这一步在 workflow 里是 `if: always()`：前面任何一步失败时镜像可能根本没建出来。
+# 那种情况下不该在这里再报一次错（真正的失败在上一步已经报了），卸载干净后直接退出即可。
+if [[ ! -e "$IMG" ]]; then
+  warn "镜像 $IMG 不存在（前面的步骤失败了？）——只做卸载，跳过校验/收缩"
+  exit 0
+fi
 e2fsck -fy "$IMG" >/dev/null 2>&1 || warn "e2fsck 报告问题（已尝试修复）"
 
 if [[ "$SHRINK" == "true" ]]; then
