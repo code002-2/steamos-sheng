@@ -1,0 +1,172 @@
+name: Build SteamOS for sheng (Steam Frame base)
+
+# 用 Steam Frame 官方镜像（Holo Core / SteamOS aarch64）作底包，注入 sheng 的内核/固件/设备包，
+# 把挂载布局改成 sheng 的 PARTLABEL 方案，产出可 fastboot 刷入的 rootfs.img + boot.img。
+# 设备包复用 archlinux-sheng 的 workflow_call（同样的 10 个 pacman 包）。
+on:
+  workflow_dispatch:
+    inputs:
+      frame_image_url:
+        description: '底包地址（Steam Frame 官方恢复镜像，公开可直连）'
+        required: true
+        type: string
+        default: 'https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2'
+      boot_mode:
+        description: '启动分区模式'
+        required: true
+        type: choice
+        default: 'dual (linux)'
+        options:
+          - 'dual (linux)'
+          - 'single (userdata)'
+      rootfs_size:
+        description: 'rootfs.img 初始大小'
+        required: false
+        type: string
+        default: '12G'
+      shrink_image:
+        description: '构建后收缩镜像（e2fsck + resize2fs -M）'
+        required: false
+        type: boolean
+        default: true
+      kernel_release:
+        description: '上游内核 release（boot 镜像与内核 deb 同源）'
+        required: false
+        type: string
+        default: '7.2.6'
+      upload_artifacts:
+        description: '上传 rootfs.img / boot.img'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  packages:
+    name: Build Device Packages (pacman)
+    uses: code002-2/archlinux-sheng/.github/workflows/_packages.yml@main
+    with:
+      kernel_source: prebuilt
+      kernel_repo: https://github.com/ianchb/sm8550-mainline
+      kernel_branch: sheng-7.2.6
+      kernel_config: sm8550.config
+      firmware_repo: https://github.com/ianchb/sheng-firmware
+      firmware_branch: master
+      rootfs_base: alarm
+
+  assemble:
+    name: Assemble SteamOS-for-sheng RootFS
+    needs: [packages]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      ROOTFS_MOUNT: /mnt/rootfs
+      WORK: /mnt/frame-work
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Parse Arguments
+        id: parse
+        run: |
+          case "${{ inputs.boot_mode }}" in
+            "single (userdata)") LABEL="userdata"; PATTERN="boot_sheng_singleboot.img" ;;
+            "dual (linux)")      LABEL="linux";    PATTERN="boot_sheng_dualboot.img" ;;
+            *) echo "::error::未知 boot_mode"; exit 1 ;;
+          esac
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "boot_pattern=$PATTERN" >> "$GITHUB_OUTPUT"
+          echo "boot_mode=${{ inputs.boot_mode }} / label=$LABEL / boot=$PATTERN"
+
+      - name: Install Host Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gh bzip2 zstd xz-utils e2fsprogs rsync util-linux p7zip-full
+
+      - name: Fetch Frame base (download → bz2 → GPT p2 → zstd → rootfs.raw)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x scripts/host/00-fetch-frame-rootfs.sh
+          sudo env FRAME_IMAGE_URL="${{ inputs.frame_image_url }}" WORK="$WORK" OUT="$WORK/out" \
+            bash scripts/host/00-fetch-frame-rootfs.sh
+
+      - name: Collect device packages
+        uses: actions/download-artifact@v8
+        with: { pattern: '*-pkg', path: pkgs, merge-multiple: true }
+
+      - name: Lay Frame userspace into our image
+        run: |
+          chmod +x scripts/host/01-lay-rootfs.sh
+          ls -lh pkgs | head -20
+          sudo bash scripts/host/01-lay-rootfs.sh "$WORK/out/rootfs.raw" rootfs.img "${{ inputs.rootfs_size }}"
+
+      - name: Mount chroot & inject sheng device layer
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$ROOTFS_MOUNT"
+          sudo mount -o loop rootfs.img "$ROOTFS_MOUNT"
+          for d in dev dev/pts proc sys tmp; do sudo mkdir -p "$ROOTFS_MOUNT/$d"; done
+          sudo mount --bind /dev "$ROOTFS_MOUNT/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_MOUNT/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_MOUNT/proc"
+          sudo mount -t sysfs sys "$ROOTFS_MOUNT/sys"
+          sudo cp /etc/resolv.conf "$ROOTFS_MOUNT/etc/resolv.conf" || true
+          sudo mkdir -p "$ROOTFS_MOUNT/tmp/pkgs" "$ROOTFS_MOUNT/root/graft"
+          sudo cp -a pkgs/. "$ROOTFS_MOUNT/tmp/pkgs/"
+          sudo cp scripts/in-chroot/10-graft.sh "$ROOTFS_MOUNT/root/graft/"
+          chmod +x scripts/in-chroot/10-graft.sh
+          sudo chroot "$ROOTFS_MOUNT" /bin/bash -c \
+            "PARTLABEL='${{ steps.parse.outputs.label }}' /root/graft/10-graft.sh"
+
+      - name: Unmount & finalize
+        if: always()
+        run: |
+          chmod +x scripts/host/03-finalize-image.sh
+          sudo env SHRINK_IMAGE="${{ inputs.shrink_image }}" bash scripts/host/03-finalize-image.sh rootfs.img "$ROOTFS_MOUNT"
+
+      - name: Fetch boot.img (upstream release, same kernel source)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.kernel_release }}" --repo ianchb/sm8550-mainline \
+            --pattern "${{ steps.parse.outputs.boot_pattern }}" --clobber
+          mv -f "${{ steps.parse.outputs.boot_pattern }}" boot.img
+          ls -lh boot.img
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## SteamOS for sheng 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 底包 | Steam Frame 官方镜像 |"
+            echo "| 分区（PARTLABEL） | ${{ steps.parse.outputs.label }} |"
+            echo "| boot 镜像 | ${{ steps.parse.outputs.boot_pattern }} |"
+            echo "| rootfs.img | $(du -h rootfs.img 2>/dev/null | cut -f1 || echo N/A) |"
+            echo "| 设备包 | $(ls -1 pkgs/*.pkg.tar.* 2>/dev/null | wc -l) 个 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload RootFS Image
+        uses: actions/upload-artifact@v7
+        with:
+          name: steamos-sheng-rootfs-${{ steps.parse.outputs.label }}
+          path: rootfs.img
+          retention-days: 14
+          compression-level: 1
+          if-no-files-found: error
+
+      - name: Upload Boot Image
+        uses: actions/upload-artifact@v7
+        with:
+          name: steamos-sheng-boot-${{ steps.parse.outputs.label }}
+          path: boot.img
+          retention-days: 14
+          compression-level: 1
+          if-no-files-found: error
