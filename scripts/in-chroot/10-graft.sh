@@ -25,6 +25,14 @@ fi
 mapfile -t fp < <(pacman -Qq 2>/dev/null | grep -E '^linux-firmware' || true)
 [[ "${#fp[@]}" -gt 0 ]] && pacman -Rdd --noconfirm --color never "${fp[@]}" || true
 
+# 0.5) 我们的包是 makepkg 产物（未签名），Frame 的 pacman.conf 若强制校验本地包签名，
+#      pacman -U 会以 "signature is unknown trust" 失败 —— 先放开本地包签名要求。
+if [[ -f /etc/pacman.conf ]]; then
+  sed -i 's/^[[:space:]]*LocalFileSigLevel.*/LocalFileSigLevel = Optional/' /etc/pacman.conf
+  grep -q '^LocalFileSigLevel' /etc/pacman.conf || sed -i '/^\[options\]/a LocalFileSigLevel = Optional' /etc/pacman.conf
+  log "已确保 LocalFileSigLevel = Optional（本地包不校验签名）"
+fi
+
 shopt -s nullglob
 pkgs=(/tmp/pkgs/*.pkg.tar.*)
 [[ "${#pkgs[@]}" -gt 0 ]] || die "/tmp/pkgs 下没有设备包"
