@@ -76,6 +76,18 @@ EOF
 hostname > /etc/hostname 2>/dev/null || echo "${HOSTNAME_OVERRIDE:-xiaomi-sheng}" > /etc/hostname
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime 2>/dev/null || true
 
+# 5.5) /var 骨架：Frame 的 /var 可能在独立子卷/分区（3.var-A.img）里，若没并进来就是空的。
+#      systemd 首启虽会用 tmpfiles 补一部分，但 pacman 数据库、DBus、日志目录得先在，
+#      否则重装/升级包时直接报错。
+for d in var/lib/pacman var/lib/dbus var/lib/systemd var/lib/systemd/coredump \
+         var/lib/NetworkManager var/lib/iwd var/log var/log/journal var/tmp \
+         var/cache var/cache/pacman/pkg home root srv mnt opt proc sys dev run tmp; do
+  mkdir -p "/$d"
+done
+chmod 1777 /tmp /var/tmp 2>/dev/null || true
+chmod 0700 /root 2>/dev/null || true
+log "/var 骨架已补齐（pacman/dbus/systemd/log 目录）"
+
 # 6) 服务：网络与桌面会话
 systemctl enable NetworkManager.service 2>/dev/null || warn "启用 NetworkManager 失败"
 for p in /usr/lib/systemd/system/gamescope-session.service /usr/lib/systemd/system/steamos-session-select.service; do [[ -e "$p" ]] && log "发现 Frame 会话单元: $p"; done
