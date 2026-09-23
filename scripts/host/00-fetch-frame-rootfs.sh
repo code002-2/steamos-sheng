@@ -45,12 +45,16 @@ CANDIDATES=(
   "https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2"
 )
 DLOAD() {
-  local u
+  local u rc
   for u in "${CANDIDATES[@]}"; do
     [[ -n "$u" ]] || continue
     log "尝试下载: $u" >&2
-    curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o - "$u" && return 0
-    warn "该地址不可用（curl $?），换下一个" >&2
+    curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o - "$u"; rc=$?
+    # ⚠️ curl 23 = "Failure writing output to destination"：下游 head/dd 读够字节就关管子，
+    #    curl 写不进去是**预期**行为，必须当成功。曾把它当失败 → DLOAD 从头重下第二个候选，
+    #    dd 把「重启的流」接着写进同一个文件 → 只产出 25 MB 垃圾（实跑踩过）。
+    if [[ "$rc" -eq 0 || "$rc" -eq 23 ]]; then return 0; fi
+    warn "该地址不可用（curl $rc），换下一个" >&2
   done
   return 1
 }
@@ -86,7 +90,12 @@ rm -f "$FRAME"
 set +o pipefail
 DLOAD | bunzip2 -c | dd of="$FRAME" bs=1M iflag=skip_bytes,count_bytes \
   skip="$ROOTFS_OFF" count="$ROOTFS_LEN" status=none
+rc_dload="${PIPESTATUS[0]}"
 set -o pipefail
+# dd 写够就停 → 上游必然 SIGPIPE，所以不能用 pipeline 状态判定；DLOAD 自己已把 23 当成功。
+# 但只要 DLOAD 真的失败（网络断了/所有地址都不通），就必须立刻退出：
+# 继续跑下去只会写出一半的分区镜像，挂载阶段报的错会离真正原因很远。
+[[ "$rc_dload" -eq 0 ]] || die "下载失败（curl $rc_dload），分区没切全"
 GOT="$(stat -c %s "$FRAME" 2>/dev/null || echo 0)"
 [[ "$GOT" -eq "$ROOTFS_LEN" ]] || die "切分区失败：期望 $ROOTFS_LEN 字节，实际 $GOT 字节（下载被截断？）"
 rm -f "$HEAD"
