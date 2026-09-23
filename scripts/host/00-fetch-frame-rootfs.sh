@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
-# 00-fetch-frame-rootfs.sh —— 取 Steam Frame 官方镜像并解出真正的 rootfs
+# 00-fetch-frame-rootfs.sh —— 取 Steam Frame 官方镜像并解出 rootfs 分区
 #
-# 底包形态（实测 20260922.5153644-0.3.0）：
-#   .img.bz2  →  bz2 里是 7 GB 的 **GPT 整盘镜像**，5 个分区：
+# 底包形态（实测 steamframe-oobe-repair-20260922.5153644-0.3.0）：
+#   .img.bz2  →  7.5 GB 的 **GPT 整盘镜像**，5 个分区：
 #       0.esp.img(256M) / 1.efi-A.fat(64M) / 2.rootfs-A.img(5G) / 3.var-A.img(256M) / 4.home.img(100M)
-#   而 2.rootfs-A.img 前 5 MiB 是保留区，之后是 **zstd 压缩流**（不是裸 ext4），
-#   7-Zip 解不动它（多帧 zstd），必须用 zstd 本体。
 #
-# 本脚本产出：$OUT/rootfs.raw（Frame 的 userspace ext4/镜像）+ $OUT/frame-os-release
+#   ⚠️ 2.rootfs-A.img 是 **btrfs 文件系统镜像**（label = rootfs-A，超块 `_BHRfS_M` 在偏移 65536），
+#      **不是**「ext4 + zstd 载荷」。曾经误判过：该分区 5 MiB+4096 处恰好有一个 zstd 帧
+#      （那只是 btrfs 里某个文件的 zstd 压缩 extent，解出来仅 8192 字节），照那个偏移切片解压
+#      只会得到一堆垃圾。正确做法就是**按文件系统直接挂载**。
+#
+#   ⚠️ 磁盘：bz2(4 GB) + 整盘镜像(7.5 GB) 同时存在就是 11.6 GB，runner 的盘不够。
+#      所以这里走「流式两遍」：第 1 遍只取前 4 MB 解析 GPT 分区表，第 2 遍
+#      curl | bunzip2 | dd 精确切出 rootfs 分区 —— 全程只落盘 5 GB。
+#
+# 产出（$OUT 下）：
+#   rootfs.frame        rootfs 分区原样镜像（约 5 GB，可 loop 挂载）
+#   frame-src-root      根子树相对路径（`.` 或 `@` / `root` 之类）
+#   frame-src-extra     需并入的子卷，每行「相对路径<TAB>目标路径」
+#   frame-os-release    Frame 的 os-release 副本（用于记录底包版本）
 #
 # 环境变量：
 #   FRAME_IMAGE_URL  默认官方 steamframe-repair-latest.img.bz2（公开可直连）
-#   WORK             工作目录（默认 /mnt/frame-work，需 ≥ 20 GB 空闲）
+#   WORK             工作目录（默认 /mnt/frame-work，需 ≥ 8 GB 空闲）
 set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log()  { printf '[%s] %s\n' "${0##*/}" "$*"; }
 warn() { printf '[%s] 警告: %s\n' "${0##*/}" "$*" >&2; }
 die()  { printf '[%s] 错误: %s\n' "${0##*/}" "$*" >&2; exit 1; }
@@ -20,86 +32,165 @@ die()  { printf '[%s] 错误: %s\n' "${0##*/}" "$*" >&2; exit 1; }
 FRAME_IMAGE_URL="${FRAME_IMAGE_URL:-https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2}"
 WORK="${WORK:-/mnt/frame-work}"
 OUT="${OUT:-$WORK/out}"
+MNT="$WORK/frame-src"
+HEAD="$WORK/frame-head.bin"
+FRAME="$OUT/rootfs.frame"
 sudo mkdir -p "$WORK" "$OUT"
-command -v zstd >/dev/null || die "需要 zstd（Ubuntu runner: apt-get install zstd xz-utils）"
 
-BZ="$WORK/frame.img.bz2"
-IMG="$WORK/frame.img"
-
-# 1) 下载（支持复用已下载文件）
-if [[ ! -s "$BZ" ]]; then
-  # 候选地址：`steamframe-repair-latest` 别名在 CDN 上会返回 BlobNotFound（CI 实测），
-  # 因此把明确的版本化文件名作为兜底；两者都试。
-  CANDIDATES=(
-    "$FRAME_IMAGE_URL"
-    "https://steamdeck-images.steamos.cloud/recovery/steamframe-oobe-repair-20260922.5153644-0.3.0.img.bz2"
-    "https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2"
-  )
-  ok=0
+# 候选地址：`steamframe-repair-latest` 别名在 CDN 上会返回 BlobNotFound（CI 实测），
+# 因此把明确的版本化文件名作为兜底；两者都试。函数把 bz2 流直接吐给 stdout。
+CANDIDATES=(
+  "$FRAME_IMAGE_URL"
+  "https://steamdeck-images.steamos.cloud/recovery/steamframe-oobe-repair-20260922.5153644-0.3.0.img.bz2"
+  "https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2"
+)
+DLOAD() {
+  local u
   for u in "${CANDIDATES[@]}"; do
     [[ -n "$u" ]] || continue
-    log "尝试下载: $u"
-    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o "$BZ.part" "$u"; then
-      mv -f "$BZ.part" "$BZ"; ok=1; break
-    fi
-    warn "该地址不可用（curl $?），换下一个"; rm -f "$BZ.part"
+    log "尝试下载: $u" >&2
+    curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o - "$u" && return 0
+    warn "该地址不可用（curl $?），换下一个" >&2
   done
-  [[ "$ok" -eq 1 ]] || die "底包下载失败：所有候选地址都不可用"
-fi
-log "底包大小: $(du -h "$BZ" | cut -f1)"
+  return 1
+}
 
-# 2) bz2 解压出整盘镜像（bz2 是单文件流，用 bunzip2 -c 流式写）
-if [[ ! -s "$IMG" ]]; then
-  log "解压 bz2 → 整盘镜像（约 7 GB，慢）"
-  bunzip2 -c "$BZ" > "$IMG" || die "bunzip2 失败"
-fi
-log "整盘镜像: $(du -h "$IMG" | cut -f1)"
-rm -f "$BZ" && log "已删除 bz2 释放空间"; df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
+# ---------------------------------------------------------------------------
+# 1) 第 1 遍：流式取镜像头（只落盘 4 MB）——用于解析 GPT 分区表
+#    head 读够就退出，上游 curl/bunzip2 会收到 SIGPIPE，所以这里临时关掉 pipefail，
+#    改用「文件内容是否含 EFI PART」来判定成败（下载失败时头文件必然是空的/不完整）。
+# ---------------------------------------------------------------------------
+log "第 1 遍：流式取镜像头（前 4 MB）"
+set +o pipefail
+DLOAD | bunzip2 -c 2>/dev/null | head -c 4194304 > "$HEAD"
+set -o pipefail
+[[ -s "$HEAD" ]] || die "取镜像头失败：三个候选地址都拿不到数据"
+log "镜像头: $(stat -c %s "$HEAD") 字节"
 
-# 3) 用 loop 设备暴露分区表，取 rootfs 分区（第 2 分区）
-LOOP="$(sudo losetup -Pf --show "$IMG")"
-trap 'sudo umount "$WORK/mnt" 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
-PART="${LOOP}p2"
-[[ -b "$PART" ]] || die "找不到 rootfs 分区 $PART"
-log "rootfs 分区: $PART ($(sudo blockdev --getsize64 "$PART") 字节)"
+# ---------------------------------------------------------------------------
+# 2) 解析分区表，定位 rootfs 分区（按名字找 rootfs*，兜底第 2 个分区）
+# ---------------------------------------------------------------------------
+python3 "$HERE/parse-gpt.py" "$HEAD" rootfs 2>&1 | sed 's/^/[gpt] /' >&2 || true
+read -r ROOTFS_OFF ROOTFS_LEN ROOTFS_NAME < <(python3 "$HERE/parse-gpt.py" "$HEAD" rootfs) \
+  || die "解析 GPT 分区表失败（底包结构可能变了）"
+[[ "$ROOTFS_OFF" =~ ^[0-9]+$ && "$ROOTFS_LEN" =~ ^[0-9]+$ ]] || die "解析出的偏移/长度非法: '$ROOTFS_OFF' '$ROOTFS_LEN'"
+[[ "$ROOTFS_LEN" -gt 1073741824 ]] || die "rootfs 分区只有 $ROOTFS_LEN 字节，明显不对"
+log "rootfs 分区: '$ROOTFS_NAME' 偏移 $ROOTFS_OFF 长度 $((ROOTFS_LEN / 1024 / 1024)) MiB"
 
-# 4) 分区内前 5 MiB 是保留区，之后是 zstd 流：扫描 zstd 魔数定位真实偏移
-#    （实测偏移 5246976 = 5 MiB + 4096，不写死，扫出来更稳）
-log "扫描 zstd 魔数（28 B5 2F FD）"
-OFF="$(sudo dd if="$PART" bs=1M count=8 status=none | od -An -tx1 -v \
-       | tr -d ' \n' | grep -bo '28b52ffd' | head -n1 | cut -d: -f1 || true)"
-[[ -n "${OFF:-}" ]] || die "前 8 MB 内没有 zstd 魔数，底包结构可能变了"
-OFF=$(( OFF / 2 ))          # od 给的是十六进制字符数 → 字节数
-log "zstd 流起点: $OFF"
-
-# 5) 切出 zstd 流并解压（zstd 自动处理多帧）
-#    ⚠️ 起点必须精确：实测偏移 5246976 = 5 MiB + 4096，若只按 MiB 对齐切，
-#    流前面会多出 4096 字节垃圾，zstd 直接解压失败（而且是致命错误）。
-log "解出真正的 rootfs（zstd -d，约 5 GB），起点 $OFF"
-if [[ $(( OFF % 4096 )) -eq 0 ]]; then
-  sudo dd if="$PART" bs=4096 skip=$(( OFF / 4096 )) status=none \
-    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
-elif [[ $(( OFF % 1048576 )) -eq 0 ]]; then
-  sudo dd if="$PART" bs=1M skip=$(( OFF / 1048576 )) status=none \
-    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
-else
-  warn "偏移 $OFF 未按 4096 对齐，退回逐字节 dd（很慢）"
-  sudo dd if="$PART" bs=1 skip="$OFF" status=none \
-    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
-fi
-log "rootfs 产出: $OUT/rootfs.raw ($(du -h "$OUT/rootfs.raw" | cut -f1))"
-
-# 6) 挂起来核对（确认是 ext4 且能看到 os-release）
-sudo mkdir -p "$WORK/mnt"
-sudo mount -o loop,ro "$OUT/rootfs.raw" "$WORK/mnt" || die "挂载失败：可能不是 ext4（看 file 输出）"
-log "挂载成功，关键信息："
-sudo sed 's/^/    /' "$WORK/mnt/usr/lib/os-release" 2>/dev/null || sudo cat "$WORK/mnt/etc/os-release" | sed 's/^/    /'
-sudo cp -f "$WORK/mnt/usr/lib/os-release" "$OUT/frame-os-release" 2>/dev/null || true
-for p in usr/lib/modules etc/pacman.conf etc/pacman.d/mirrorlist usr/lib/libvulkan_freedreno.so usr/bin/gamescope sbin/init usr/share/wayland-sessions; do
-  if sudo test -e "$WORK/mnt/$p"; then echo "    [ OK ] /$p"; else echo "    [ -- ] /$p"; fi
-done
-sudo umount "$WORK/mnt"
-sudo losetup -d "$LOOP" 2>/dev/null || true
-rm -f "$IMG" && log "已删除整盘镜像释放 7 GB"
+# ---------------------------------------------------------------------------
+# 3) 第 2 遍：流式切出 rootfs 分区（bz2 → 跳过 OFFSET → 只写 LEN 字节）
+#    同样关掉 pipefail（dd 写够就停，上游必然 SIGPIPE），改用「产出文件大小」判定成败。
+# ---------------------------------------------------------------------------
+log "第 2 遍：流式切出 $((ROOTFS_LEN / 1024 / 1024)) MiB（bz2 无法跳读，需从头解一遍）"
+rm -f "$FRAME"
+set +o pipefail
+DLOAD | bunzip2 -c | dd of="$FRAME" bs=1M iflag=skip_bytes,count_bytes \
+  skip="$ROOTFS_OFF" count="$ROOTFS_LEN" status=none
+set -o pipefail
+GOT="$(stat -c %s "$FRAME" 2>/dev/null || echo 0)"
+[[ "$GOT" -eq "$ROOTFS_LEN" ]] || die "切分区失败：期望 $ROOTFS_LEN 字节，实际 $GOT 字节（下载被截断？）"
+rm -f "$HEAD"
+log "已切出: $(du -h "$FRAME" | cut -f1)"
 df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
-log "底包就绪: $OUT/rootfs.raw"
+
+# ---------------------------------------------------------------------------
+# 4) 识别文件系统类型（btrfs / ext4）——决定挂载参数
+# ---------------------------------------------------------------------------
+sudo modprobe btrfs 2>/dev/null || warn "modprobe btrfs 失败（若底包是 btrfs 会挂不上）"
+FSTYPE="$(sudo blkid -o value -s TYPE "$FRAME" 2>/dev/null || true)"
+[[ -n "$FSTYPE" ]] || FSTYPE="auto"
+LABEL="$(sudo blkid -o value -s LABEL "$FRAME" 2>/dev/null || true)"
+log "rootfs.frame: fstype=$FSTYPE label=${LABEL:-无}"
+[[ "$FSTYPE" == "auto" ]] && die "切出来的分区认不出文件系统（偏移算错了？）"
+
+# ---------------------------------------------------------------------------
+# 5) 挂载：btrfs 用 subvolid=5 挂顶层（能看到所有子卷）
+# ---------------------------------------------------------------------------
+sudo mkdir -p "$MNT"
+sudo umount "$MNT" 2>/dev/null || true
+MOUNTED=0
+if [[ "$FSTYPE" == "btrfs" ]]; then
+  sudo mount -o loop,ro,subvolid=5 "$FRAME" "$MNT" && MOUNTED=1 || true
+fi
+if [[ "$MOUNTED" -eq 0 ]]; then
+  log "改用自动识别挂载（-o loop,ro）"
+  sudo mount -o loop,ro "$FRAME" "$MNT" || die "挂载失败：既不是可识别的 btrfs，也不是 ext4"
+fi
+trap 'sudo umount "$MNT" 2>/dev/null || true' EXIT
+log "已挂载，顶层内容："; sudo ls -A "$MNT" | head -20 | sed 's/^/    /'
+
+# ---------------------------------------------------------------------------
+# 6) 找根子树：先看挂载点本身，再看一层/两层子目录里谁含 usr/lib/os-release
+# ---------------------------------------------------------------------------
+has_root() { sudo test -e "$1/usr/lib/os-release" || sudo test -e "$1/etc/os-release"; }
+SRC_ROOT=""
+if has_root "$MNT"; then
+  SRC_ROOT="."
+else
+  while IFS= read -r d; do
+    rel="${d#"$MNT"/}"
+    if has_root "$d"; then SRC_ROOT="$rel"; break; fi
+    while IFS= read -r d2; do
+      rel2="${d2#"$MNT"/}"
+      if has_root "$d2"; then SRC_ROOT="$rel2"; break 2; fi
+    done < <(sudo find "$d" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+  done < <(sudo find "$MNT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+fi
+[[ -n "$SRC_ROOT" ]] || die "挂载成功但找不到根子树（没有任何目录含 usr/lib/os-release），底包结构可能变了"
+log "根子树: $SRC_ROOT"
+
+# ---------------------------------------------------------------------------
+# 7) 平级子卷 → 目标路径映射（SteamOS 的 btrfs 常把 /var /home 放独立子卷）
+#    不并进来会出现「/var 空空如也」→ systemd 起不来、pacman 数据库也没了
+# ---------------------------------------------------------------------------
+EXTRA_FILE="$OUT/frame-src-extra"
+: > "$EXTRA_FILE"
+merge_map() {
+  local src="$1" dst="$2"
+  [[ -d "$MNT/$src" ]] || return 0
+  printf '%s\t%s\n' "$src" "$dst" >> "$EXTRA_FILE"
+  log "并入子卷: $src → /$dst"
+}
+for pair in '@var:var' 'var:var' '@var-log:var/log' 'var-log:var/log' '@home:home' 'home:home' \
+            '@usr:usr' 'usr:usr' '@opt:opt' 'opt:opt' '@srv:srv' 'srv:srv' '@root:root' 'root:root'; do
+  s="${pair%%:*}"; d="${pair##*:}"
+  [[ "$s" == "$SRC_ROOT" ]] && continue
+  [[ "$d" == "root" && "$SRC_ROOT" != "." ]] && continue
+  merge_map "$s" "$d"
+done
+[[ -s "$EXTRA_FILE" ]] || log "没有需要额外并入的子卷"
+
+# ---------------------------------------------------------------------------
+# 8) 关键信息核对 + 落盘 os-release
+# ---------------------------------------------------------------------------
+if [[ "$FSTYPE" == "btrfs" ]] && command -v btrfs >/dev/null; then
+  log "btrfs 子卷清单："; sudo btrfs subvolume list "$MNT" 2>/dev/null | sed 's/^/    /' || true
+fi
+if sudo test -e "$MNT/$SRC_ROOT/usr/lib/os-release"; then
+  sudo sed 's/^/    /' "$MNT/$SRC_ROOT/usr/lib/os-release"
+  sudo cp -f "$MNT/$SRC_ROOT/usr/lib/os-release" "$OUT/frame-os-release"
+elif sudo test -e "$MNT/$SRC_ROOT/etc/os-release"; then
+  sudo sed 's/^/    /' "$MNT/$SRC_ROOT/etc/os-release"
+  sudo cp -f "$MNT/$SRC_ROOT/etc/os-release" "$OUT/frame-os-release"
+fi
+PROBE_ROOT="$MNT/$SRC_ROOT"
+log "关键路径自查（根子树内）："
+for p in usr/lib/modules etc/pacman.conf etc/pacman.d/mirrorlist usr/lib/libvulkan_freedreno.so \
+         usr/bin/gamescope usr/bin/steamos-session-select usr/lib/systemd/systemd sbin/init \
+         usr/share/wayland-sessions usr/lib/os-release var/lib/pacman home; do
+  if sudo test -e "$PROBE_ROOT/$p"; then echo "    [ OK ] /$p"; else echo "    [ -- ] /$p"; fi
+done
+log "根子树占用（目标镜像至少要比它大 1.5 GB）："
+sudo du -sm --exclude=proc --exclude=sys --exclude=dev --exclude=run --exclude=tmp "$PROBE_ROOT" 2>/dev/null \
+  | awk '{printf "    %d MiB (%.2f GiB)\n", $1, $1/1024}' || true
+if [[ -s "$EXTRA_FILE" ]]; then
+  while IFS=$'\t' read -r s d; do
+    [[ -n "$s" ]] || continue
+    sudo du -sm "$MNT/$s" 2>/dev/null | awk -v s="$s" '{printf "    子卷 %s: %d MiB\n", s, $1}' || true
+  done < "$EXTRA_FILE"
+fi
+
+printf '%s\n' "$SRC_ROOT" > "$OUT/frame-src-root"
+sudo umount "$MNT"; trap - EXIT
+df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
+log "底包就绪: $FRAME（根子树 $SRC_ROOT，额外子卷 $(wc -l < "$EXTRA_FILE") 个）"
