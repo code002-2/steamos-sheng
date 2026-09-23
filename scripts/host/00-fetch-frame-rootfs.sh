@@ -40,6 +40,7 @@ if [[ ! -s "$IMG" ]]; then
   bunzip2 -c "$BZ" > "$IMG" || die "bunzip2 失败"
 fi
 log "整盘镜像: $(du -h "$IMG" | cut -f1)"
+rm -f "$BZ" && log "已删除 bz2 释放空间"; df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
 
 # 3) 用 loop 设备暴露分区表，取 rootfs 分区（第 2 分区）
 LOOP="$(sudo losetup -Pf --show "$IMG")"
@@ -84,4 +85,7 @@ for p in usr/lib/modules etc/pacman.conf etc/pacman.d/mirrorlist usr/lib/libvulk
   if sudo test -e "$WORK/mnt/$p"; then echo "    [ OK ] /$p"; else echo "    [ -- ] /$p"; fi
 done
 sudo umount "$WORK/mnt"
+sudo losetup -d "$LOOP" 2>/dev/null || true
+rm -f "$IMG" && log "已删除整盘镜像释放 7 GB"
+df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
 log "底包就绪: $OUT/rootfs.raw"
