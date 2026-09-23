@@ -49,7 +49,10 @@ DLOAD() {
   for u in "${CANDIDATES[@]}"; do
     [[ -n "$u" ]] || continue
     log "尝试下载: $u" >&2
-    curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o - "$u"; rc=$?
+    # ⚠️ 必须写成 `|| rc=$?`：直接 `curl ...; rc=$?` 时，set -e 会在 curl 非 0 的瞬间就把
+    #    这个子 shell 干掉，下面的 23 判断根本执行不到（实跑踩过：报「下载失败（curl 23）」）。
+    rc=0
+    curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 -o - "$u" || rc=$?
     # ⚠️ curl 23 = "Failure writing output to destination"：下游 head/dd 读够字节就关管子，
     #    curl 写不进去是**预期**行为，必须当成功。曾把它当失败 → DLOAD 从头重下第二个候选，
     #    dd 把「重启的流」接着写进同一个文件 → 只产出 25 MB 垃圾（实跑踩过）。
