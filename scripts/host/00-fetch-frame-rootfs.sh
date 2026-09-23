@@ -60,6 +60,40 @@ DLOAD() {
 }
 
 # ---------------------------------------------------------------------------
+# 0) 资产优先：若本项目已把「解好的 rootfs 分区」发布成 release 资产（见 00b-publish-base.sh），
+#    直接下载拼回即可 —— 省掉每次「下 3.8 GB bz2 + 解两遍 bz2」，也不需要 GPT 解析。
+#    想强制走原始 bz2 路径：FRAME_BASE_SKIP=1（发布脚本自己就是这么调用的）
+# ---------------------------------------------------------------------------
+BASE_TAG="${FRAME_BASE_TAG:-frame-base-20260922}"
+BASE_REPO="${FRAME_BASE_REPO:-code002-2/steamos-sheng}"
+declare -a ASSETS=()
+if [[ "${FRAME_BASE_SKIP:-0}" != "1" ]] && [[ -n "${GH_TOKEN:-}" ]] && command -v gh >/dev/null; then
+  mapfile -t ASSETS < <(gh release view "$BASE_TAG" --repo "$BASE_REPO" --json assets \
+    --jq '.assets[].name' 2>/dev/null | grep -E '^rootfs\.part[0-9]+\.zst$' | sort || true)
+fi
+
+if [[ "${#ASSETS[@]}" -gt 0 ]]; then
+  log "发现已发布的底包资产 $BASE_REPO@$BASE_TAG：${ASSETS[*]}"
+  mkdir -p "$WORK/base"
+  : > "$FRAME"
+  for a in "${ASSETS[@]}"; do
+    log "  下载并解压 $a"
+    gh release download "$BASE_TAG" --repo "$BASE_REPO" --pattern "$a" --dir "$WORK/base" --clobber \
+      || die "下载资产 $a 失败"
+    zstd -dc "$WORK/base/$a" >> "$FRAME" || die "解压资产 $a 失败（文件损坏？）"
+    rm -f "$WORK/base/$a"   # 逐块删，保证磁盘峰值只有「已解出的部分 + 当前块」
+    log "    累计 $(du -h "$FRAME" | cut -f1)"
+  done
+  GOT="$(stat -c %s "$FRAME")"
+  if [[ "$GOT" -lt 1073741824 ]]; then
+    die "拼回的 rootfs 只有 $GOT 字节，资产不完整（删掉 release 里的资产重发一次）"
+  fi
+  log "资产路径完成：$GOT 字节"
+  df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
+else
+  log "没有可用的底包资产，走原始路径（官方 bz2 → GPT → 切分区）"
+
+# ---------------------------------------------------------------------------
 # 1) 第 1 遍：流式取镜像头（只落盘 4 MB）——用于解析 GPT 分区表
 #    head 读够就退出，上游 curl/bunzip2 会收到 SIGPIPE，所以这里临时关掉 pipefail，
 #    改用「文件内容是否含 EFI PART」来判定成败（下载失败时头文件必然是空的/不完整）。
@@ -101,6 +135,7 @@ GOT="$(stat -c %s "$FRAME" 2>/dev/null || echo 0)"
 rm -f "$HEAD"
 log "已切出: $(du -h "$FRAME" | cut -f1)"
 df -h "$WORK" | tail -1 | sed "s/^/    磁盘: /"
+fi
 
 # ---------------------------------------------------------------------------
 # 4) 识别文件系统类型（btrfs / ext4）——决定挂载参数
