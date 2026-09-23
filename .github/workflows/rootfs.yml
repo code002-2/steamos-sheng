@@ -116,7 +116,11 @@ jobs:
           sudo mount --bind /dev/pts "$ROOTFS_MOUNT/dev/pts"
           sudo mount -t proc proc "$ROOTFS_MOUNT/proc"
           sudo mount -t sysfs sys "$ROOTFS_MOUNT/sys"
-          sudo cp /etc/resolv.conf "$ROOTFS_MOUNT/etc/resolv.conf" || true
+          # resolv.conf 可能是悬空软链（Frame 指向 /run/systemd/resolve/...），必须先删再写，
+          # 否则 chroot 内没有 DNS → pacman -Sy 补依赖失败（这个坑在 ubuntu/arch 两个仓库都踩过）
+          sudo rm -f "$ROOTFS_MOUNT/etc/resolv.conf"
+          sudo cp /etc/resolv.conf "$ROOTFS_MOUNT/etc/resolv.conf" 2>/dev/null || \
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "$ROOTFS_MOUNT/etc/resolv.conf" >/dev/null
           sudo mkdir -p "$ROOTFS_MOUNT/tmp/pkgs" "$ROOTFS_MOUNT/root/graft"
           sudo cp -a pkgs/. "$ROOTFS_MOUNT/tmp/pkgs/"
           sudo cp scripts/in-chroot/10-graft.sh "$ROOTFS_MOUNT/root/graft/"
