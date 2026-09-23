@@ -57,6 +57,7 @@ jobs:
       firmware_repo: https://github.com/ianchb/sheng-firmware
       firmware_branch: master
       rootfs_base: alarm
+      source_repo: code002-2/archlinux-sheng
 
   assemble:
     name: Assemble SteamOS-for-sheng RootFS
