@@ -58,14 +58,19 @@ OFF=$(( OFF / 2 ))          # od 给的是十六进制字符数 → 字节数
 log "zstd 流起点: $OFF"
 
 # 5) 切出 zstd 流并解压（zstd 自动处理多帧）
-log "解出真正的 rootfs（zstd -d，约 5 GB）"
-sudo dd if="$PART" bs=1M skip=$(( OFF / 1048576 )) status=none \
-  | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败"
-# 偏移不是整 MiB 时补掉余数
-REM=$(( OFF % 1048576 ))
-if [[ "$REM" -ne 0 ]]; then
-  warn "偏移未对齐 MiB（余 $REM 字节），改用精确 dd"
-  sudo dd if="$PART" bs=1 skip="$OFF" status=none | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败"
+#    ⚠️ 起点必须精确：实测偏移 5246976 = 5 MiB + 4096，若只按 MiB 对齐切，
+#    流前面会多出 4096 字节垃圾，zstd 直接解压失败（而且是致命错误）。
+log "解出真正的 rootfs（zstd -d，约 5 GB），起点 $OFF"
+if [[ $(( OFF % 4096 )) -eq 0 ]]; then
+  sudo dd if="$PART" bs=4096 skip=$(( OFF / 4096 )) status=none \
+    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
+elif [[ $(( OFF % 1048576 )) -eq 0 ]]; then
+  sudo dd if="$PART" bs=1M skip=$(( OFF / 1048576 )) status=none \
+    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
+else
+  warn "偏移 $OFF 未按 4096 对齐，退回逐字节 dd（很慢）"
+  sudo dd if="$PART" bs=1 skip="$OFF" status=none \
+    | zstd -d -q -o "$OUT/rootfs.raw" -f || die "zstd 解压失败（偏移 $OFF）"
 fi
 log "rootfs 产出: $OUT/rootfs.raw ($(du -h "$OUT/rootfs.raw" | cut -f1))"
 
