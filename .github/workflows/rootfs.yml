@@ -20,10 +20,10 @@ on:
           - 'dual (linux)'
           - 'single (userdata)'
       rootfs_size:
-        description: 'rootfs.img 初始大小'
+        description: 'rootfs.img 初始大小（下限；脚本会按底包实际用量自动放大）'
         required: false
         type: string
-        default: '12G'
+        default: '8G'
       shrink_image:
         description: '构建后收缩镜像（e2fsck + resize2fs -M）'
         required: false
