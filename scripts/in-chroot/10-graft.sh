@@ -37,10 +37,20 @@ shopt -s nullglob
 pkgs=(/tmp/pkgs/*.pkg.tar.*)
 [[ "${#pkgs[@]}" -gt 0 ]] || die "/tmp/pkgs 下没有设备包"
 log "安装 sheng 设备包（${#pkgs[@]} 个）"
+# 先做一次依赖体检：pacman -T 只列出"没被满足的依赖"，是排查跨发行版底包最直接的依据
+log "依赖检查（pacman -T，列出未满足项）："
+pacman -T "${pkgs[@]}" 2>&1 | sed 's/^/    /' || true
+
 if ! pacman -U --noconfirm --color never "${pkgs[@]}"; then
   warn "首次安装失败，刷新数据库补依赖后重试"
-  pacman -Sy --noconfirm --color never || true
-  pacman -U --noconfirm --color never "${pkgs[@]}" || die "设备包安装失败（看上面的依赖错误）"
+  pacman -Sy --noconfirm --color never || warn "pacman -Sy 失败（Frame 的仓库可能是内部通道，无法补包）"
+  if ! pacman -U --noconfirm --color never "${pkgs[@]}"; then
+    # 兜底：Frame 自带的内部仓库补不上依赖时，用 --nodeps 强装（文件照常就位；
+    # 缺的运行期依赖由 Frame 自身 userspace 提供），但明确告警以便人工核查。
+    warn "依赖仍不满足 → 改用 --nodeps 强装（记下上面的 pacman -T 输出！）"
+    pacman -U --noconfirm --color never --nodeps "${pkgs[@]}" \
+      || die "设备包安装失败（连 --nodeps 都装不上）"
+  fi
 fi
 
 # 3) 内核模块索引（无 initramfs 启动的前提）
