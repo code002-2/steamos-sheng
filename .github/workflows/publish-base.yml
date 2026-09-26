@@ -1,0 +1,69 @@
+name: Publish Frame base (release assets)
+
+# 把 Steam Frame 官方恢复镜像里解出的 rootfs 分区（5 GiB btrfs）切块压缩后发布成 release 资产，
+# 后续 rootfs.yml 构建直接下载拼回即可 —— 省掉每次「下 3.8 GB bz2 + 解两遍 + 解析 GPT」约 10 分钟。
+# 底包换版本（新的 oobe-repair 日期）时重跑一次即可，资产名固定为 rootfs.partNN.zst。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布到哪个 release tag'
+        required: true
+        type: string
+        default: 'frame-base-20260922'
+      frame_image_url:
+        description: '官方恢复镜像地址（公开直连）'
+        required: true
+        type: string
+        default: 'https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2'
+
+permissions:
+  contents: write
+
+env:
+  WORK: /mnt/frame-work
+
+jobs:
+  publish:
+    name: Publish Frame rootfs partition
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY/CodeQL" 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install Host Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gh bzip2 zstd xz-utils e2fsprogs rsync util-linux p7zip-full btrfs-progs python3
+
+      - name: Extract & publish rootfs partition
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x scripts/host/00-fetch-frame-rootfs.sh scripts/host/00b-publish-base.sh
+          sudo env GH_TOKEN="$GH_TOKEN" TAG="${{ inputs.tag }}" WORK="$WORK" OUT="$WORK/out" \
+            FRAME_IMAGE_URL="${{ inputs.frame_image_url }}" \
+            bash scripts/host/00b-publish-base.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Frame 底包发布"
+            echo ""
+            echo "- release tag: \`${{ inputs.tag }}\`"
+            echo "- 资产: rootfs.partNN.zst + SHA256SUMS"
+            echo ""
+            echo '```'
+            df -h / | tail -2
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

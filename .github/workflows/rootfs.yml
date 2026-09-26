@@ -1,0 +1,254 @@
+name: Build SteamOS for sheng (Steam Frame base)
+
+# 用 Steam Frame 官方镜像（Holo Core / SteamOS aarch64）作底包，注入 sheng 的内核/固件/设备包，
+# 把挂载布局改成 sheng 的 PARTLABEL 方案，产出可 fastboot 刷入的 rootfs.img + boot.img。
+# 设备包复用 archlinux-sheng 的 workflow_call（同样的 15 个 pacman 包）。
+on:
+  workflow_dispatch:
+    inputs:
+      frame_image_url:
+        description: '底包地址（Steam Frame 官方恢复镜像，公开可直连）'
+        required: true
+        type: string
+        default: 'https://steamdeck-images.steamos.cloud/recovery/steamframe-repair-latest.img.bz2'
+      boot_mode:
+        description: '启动分区模式'
+        required: true
+        type: choice
+        default: 'dual (linux)'
+        options:
+          - 'dual (linux)'
+          - 'single (userdata)'
+      rootfs_size:
+        description: 'rootfs.img 初始大小（下限；脚本会按底包实际用量自动放大）'
+        required: false
+        type: string
+        default: '14G'
+      shrink_image:
+        description: '构建后收缩镜像（e2fsck + resize2fs -M）'
+        required: false
+        type: boolean
+        default: true
+      kernel_release:
+        description: '上游内核 release（boot 镜像与内核 deb 同源）'
+        required: false
+        type: string
+        default: '7.2.6'
+      upload_artifacts:
+        description: '上传 rootfs.img / boot.img（关掉只做构建校验，不产出可下载产物）'
+        required: false
+        type: boolean
+        default: true
+      wifi_ssid:
+        description: '开机自动连接的 WiFi 名称（留空则不配置）'
+        required: false
+        type: string
+        default: ''
+      wifi_password:
+        description: 'WiFi 密码（只作为构建输入，不写进仓库）'
+        required: false
+        type: string
+        default: ''
+      ssh_pubkey:
+        description: '写入 root 的 authorized_keys 的 SSH 公钥（公钥登录不依赖密码/PAM；留空则不写）'
+        required: false
+        type: string
+        default: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH/L6DiLQlk8bLh0dMm3c4yrGsYGZfgw+z4QNw5jXu9C sheng'
+      root_password:
+        description: 'root 密码（用于 SSH 登录；留空则不设置）'
+        required: false
+        type: string
+        default: '123456'
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  packages:
+    name: Build Device Packages (pacman)
+    uses: code002-2/archlinux-sheng/.github/workflows/_packages.yml@main
+    with:
+      kernel_source: prebuilt
+      # ⚠️ 必须与下面取 boot.img 用的是同一个 tag：默认取「最新 release」会拿到比
+      #    7.2.6(09-16) 更新的 7.2.6-mac(09-17)，内核模块与 boot.img 的 vermagic 不一致 → 黑屏
+      kernel_release: ${{ inputs.kernel_release }}
+      kernel_repo: https://github.com/ianchb/sm8550-mainline
+      kernel_branch: sheng-7.2.6
+      kernel_config: sm8550.config
+      firmware_repo: https://github.com/ianchb/sheng-firmware
+      firmware_branch: master
+      rootfs_base: alarm
+      source_repo: code002-2/archlinux-sheng
+
+  assemble:
+    name: Assemble SteamOS-for-sheng RootFS
+    needs: [packages]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      ROOTFS_MOUNT: /mnt/rootfs
+      WORK: /mnt/frame-work
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Parse Arguments
+        id: parse
+        run: |
+          case "${{ inputs.boot_mode }}" in
+            "single (userdata)") LABEL="userdata"; PATTERN="boot_sheng_singleboot.img" ;;
+            "dual (linux)")      LABEL="linux";    PATTERN="boot_sheng_dualboot.img" ;;
+            *) echo "::error::未知 boot_mode"; exit 1 ;;
+          esac
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "boot_pattern=$PATTERN" >> "$GITHUB_OUTPUT"
+          echo "boot_mode=${{ inputs.boot_mode }} / label=$LABEL / boot=$PATTERN"
+
+      - name: Free disk space (Frame 底包 5 GB + 目标镜像要同时存在)
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY/CodeQL" 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install Host Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gh bzip2 zstd xz-utils e2fsprogs rsync util-linux p7zip-full btrfs-progs
+
+      - name: Fetch Frame base (download → bz2 → GPT p2 切出 rootfs 分区 → 按文件系统挂载核对)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x scripts/host/00-fetch-frame-rootfs.sh
+          sudo env FRAME_IMAGE_URL="${{ inputs.frame_image_url }}" WORK="$WORK" OUT="$WORK/out" \
+            bash scripts/host/00-fetch-frame-rootfs.sh
+
+      - name: Collect device packages
+        # ⚠️ 这里必须是 '*-pkg*'，不能是 '*-pkg'：archlinux-sheng 的 6 个 xiaomi-* 设备包
+        # （含触屏 daemon xiaomi-sheng-thp、xiaomi-pen-status、指纹、键盘 helper…）由一个名为
+        # **xiaomi-pkgs**（复数，结尾是 -pkgs）的产物一次性上传，而 '*-pkg' 要求名字以 '-pkg'
+        # 结尾 → **一个都匹配不上**。实测日志：Found 11 artifact(s) / downloaded 9，
+        # pkgs/ 里只有 9 个包，6 个 xiaomi-* 全丢 → 刷进设备后 /proc/nvt_thp_* 有、
+        # 但 xiaomi-sheng-thp.service 根本不存在（实机原话：Unit does not exist）。
+        # xiaomi-debs 不含 '-pkg'，仍不会被误收。
+        uses: actions/download-artifact@v8
+        with: { pattern: '*-pkg*', path: pkgs, merge-multiple: true }
+
+      - name: Verify collected packages (缺包直接失败，别等刷完才发现功能没有)
+        run: |
+          set -euo pipefail
+          echo "收集到 $(ls -1 pkgs/*.pkg.tar.* | wc -l) 个包："
+          ls -1 pkgs | sed 's/^/    /'
+          missing=()
+          for want in linux-xiaomi-sheng firmware-xiaomi-sheng libssc iio-sensor-proxy-sheng \
+                      sheng-sensors sheng-devauth alsa-xiaomi-sheng fastrpc \
+                      libfprint fprintd \
+                      xiaomi-sheng-thp xiaomi-pen-status xiaomi-sheng-fingerprint \
+                      xiaomi-mipps-auth xiaomi-charger-mode xiaomi-sheng-keyboard-helper; do
+            compgen -G "pkgs/${want}-*.pkg.tar.*" >/dev/null || missing+=("$want")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::缺少设备包：${missing[*]}"
+            exit 1
+          fi
+          echo "✓ 16 个关键设备包齐全（含触屏 xiaomi-sheng-thp 与指纹栈 libfprint/fprintd）"
+
+      - name: Lay Frame userspace into our image
+        run: |
+          chmod +x scripts/host/01-lay-rootfs.sh
+          ls -lh pkgs | head -20
+          sudo bash scripts/host/01-lay-rootfs.sh "$WORK/out/rootfs.frame" rootfs.img "${{ inputs.rootfs_size }}"
+
+      - name: Mount chroot & inject sheng device layer
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$ROOTFS_MOUNT"
+          sudo mount -o loop rootfs.img "$ROOTFS_MOUNT"
+          for d in dev dev/pts proc sys tmp; do sudo mkdir -p "$ROOTFS_MOUNT/$d"; done
+          sudo mount --bind /dev "$ROOTFS_MOUNT/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_MOUNT/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_MOUNT/proc"
+          sudo mount -t sysfs sys "$ROOTFS_MOUNT/sys"
+          # resolv.conf 可能是悬空软链（Frame 指向 /run/systemd/resolve/...），必须先删再写，
+          # 否则 chroot 内没有 DNS → pacman -Sy 补依赖失败（这个坑在 ubuntu/arch 两个仓库都踩过）
+          sudo rm -f "$ROOTFS_MOUNT/etc/resolv.conf"
+          sudo cp /etc/resolv.conf "$ROOTFS_MOUNT/etc/resolv.conf" 2>/dev/null || \
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "$ROOTFS_MOUNT/etc/resolv.conf" >/dev/null
+          sudo mkdir -p "$ROOTFS_MOUNT/tmp/pkgs" "$ROOTFS_MOUNT/root/graft"
+          sudo cp -a pkgs/. "$ROOTFS_MOUNT/tmp/pkgs/"
+          sudo cp scripts/in-chroot/10-graft.sh "$ROOTFS_MOUNT/root/graft/"
+          # 注意：这里必须给**镜像里的副本**加执行位。第一版只 chmod 了仓库里的源文件、
+          # 而且是在 cp 之后 → chroot 内直接以 /root/graft/10-graft.sh 调用时
+          # 报 `Permission denied`（exit 126）。调用处也一并改成 `bash <脚本>` 双保险。
+          sudo chmod +x "$ROOTFS_MOUNT/root/graft/10-graft.sh"
+          chmod +x scripts/in-chroot/10-graft.sh
+          sudo chroot "$ROOTFS_MOUNT" /bin/bash -c \
+            "PARTLABEL='${{ steps.parse.outputs.label }}' WIFI_SSID='${{ inputs.wifi_ssid }}' WIFI_PSK='${{ inputs.wifi_password }}' ROOT_PW='${{ inputs.root_password }}' SSH_PUBKEY='${{ inputs.ssh_pubkey }}' bash /root/graft/10-graft.sh"
+
+      - name: Unmount & finalize
+        if: always()
+        run: |
+          chmod +x scripts/host/03-finalize-image.sh
+          sudo env SHRINK_IMAGE="${{ inputs.shrink_image }}" bash scripts/host/03-finalize-image.sh rootfs.img "$ROOTFS_MOUNT"
+
+      - name: Fetch boot.img (upstream release, same kernel source)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.kernel_release }}" --repo ianchb/sm8550-mainline \
+            --pattern "${{ steps.parse.outputs.boot_pattern }}" --clobber
+          mv -f "${{ steps.parse.outputs.boot_pattern }}" boot.img
+          ls -lh boot.img
+
+      - name: Add rootwait to boot.img（关键修复：实机验证过）
+        run: |
+          chmod +x scripts/host/05-patch-bootimg-cmdline.sh
+          # 上游 boot.img 的 cmdline 是 `root=PARTLABEL=userdata`，**没有 rootwait**。
+          # root=PARTLABEL= 的解析要等块设备枚举 + 分区表扫描完成；没有 rootwait 时内核
+          # 找不到设备就直接 panic，而显示器尚未初始化 → 屏幕全黑、一个字都没有。
+          # 这是时序竞态，所以同一份镜像有时能起、有时全黑（实机反复遇到过）。
+          # 实测只加这一个参数（9 字节改动）即可点亮；内核/dtb 一个字节未动。
+          bash scripts/host/05-patch-bootimg-cmdline.sh boot.img rootwait
+      - name: Verify kernel/module version match (不一致直接失败，别等刷完黑屏)
+        run: |
+          chmod +x scripts/host/04-verify-kernel-match.sh
+          bash scripts/host/04-verify-kernel-match.sh boot.img rootfs.img
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## SteamOS for sheng 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 底包 | Steam Frame 官方镜像 |"
+            echo "| 分区（PARTLABEL） | ${{ steps.parse.outputs.label }} |"
+            echo "| boot 镜像 | ${{ steps.parse.outputs.boot_pattern }} |"
+            echo "| rootfs.img | $(du -h rootfs.img 2>/dev/null | cut -f1 || echo N/A) |"
+            echo "| 设备包 | $(ls -1 pkgs/*.pkg.tar.* 2>/dev/null | wc -l) 个 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload RootFS Image
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: steamos-sheng-rootfs-${{ steps.parse.outputs.label }}
+          path: rootfs.img
+          retention-days: 14
+          compression-level: 1
+          if-no-files-found: error
+
+      - name: Upload Boot Image
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: steamos-sheng-boot-${{ steps.parse.outputs.label }}
+          path: boot.img
+          retention-days: 14
+          compression-level: 1
+          if-no-files-found: error
